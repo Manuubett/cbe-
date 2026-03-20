@@ -258,6 +258,14 @@ select.minp{cursor:pointer;appearance:none;background-image:url("data:image/svg+
     <div class="lc-body">
       <div class="alert err" id="loginErr"><span>⚠️</span><span id="loginErrMsg"></span></div>
       <div class="field">
+        <label>School Code</label>
+        <div class="inp-wrap">
+          <span class="inp-icon">🏫</span>
+          <input class="inp" type="text" id="liCode" placeholder="e.g. EMB001" autocomplete="off" style="text-transform:uppercase" oninput="this.value=this.value.toUpperCase()">
+        </div>
+        <div style="font-size:11px;color:var(--text3);margin-top:4px">Your unique school code — provided by the system administrator</div>
+      </div>
+      <div class="field">
         <label>Email</label>
         <div class="inp-wrap"><span class="inp-icon">✉️</span><input class="inp" type="email" id="liEmail" placeholder="admin@school.ac.ke" autocomplete="email"></div>
       </div>
@@ -503,7 +511,8 @@ auth.setPersistence(firebase.auth.Auth.Persistence.SESSION).catch(()=>{});
 // ── Core state ──
 let allTeachers = [], editingUid = null, deletingUid = null;
 let _schoolId   = null;   // = admin's uid — Firestore key for ALL school data
-let _schoolName = '';     // from Firestore settings/school only — never localStorage
+let _schoolName = '';     // from Firestore only — never any storage
+let _schoolCode = null;   // in-memory only — never persisted
 let _profile    = null;
 let _sessionId  = null;
 let _ownerMsgUnsub = null;
@@ -545,16 +554,36 @@ auth.onAuthStateChanged(async u => {
     }
 
     _profile  = snap.data();
-    // schoolId = the admin's own UID — unique per school, stable, can't be spoofed
-    _schoolId = u.uid;
-    window._schoolId = u.uid; // expose for school-settings.js — session only
+
+    // schoolId — use in-memory _schoolCode set at doLogin()
+    // If _schoolCode is set (fresh login this page load), verify and use it
+    // If not set (onAuthStateChanged fired without a fresh login — e.g. page refresh),
+    // require the user to log in again — no storage fallback for security
+    if(_schoolCode){
+      // Verify the code still belongs to this email
+      const codeSnap = await db.collection('schoolCodes').doc(_schoolCode).get();
+      if(!codeSnap.exists || codeSnap.data().adminEmail !== u.email){
+        _schoolCode = null;
+        await auth.signOut(); show('Login');
+        el('loginErrMsg').textContent = 'School code does not match your account.';
+        el('loginErr').classList.add('show'); return;
+      }
+      _schoolId = codeSnap.data().schoolId;
+    } else {
+      // No in-memory code — page was refreshed or session resumed without login
+      // Sign out and require fresh login with school code for security
+      await auth.signOut();
+      show('Login');
+      return;
+    }
+
+    window._schoolId = _schoolId; // expose for school-settings.js — session only
 
     el('adminName').textContent = '👤 ' + (_profile.fullName || _profile.email || '');
-    el('hdrSchoolId').textContent = _schoolId.slice(0,8)+'…';
-    el('hdrSchoolId').title = 'School ID: ' + _schoolId;
+    el('hdrSchoolId').textContent = storedCode || _schoolId.slice(0,8)+'…';
+    el('hdrSchoolId').title = 'School: ' + (storedCode||'') + ' · ID: ' + _schoolId;
 
     // 2. Verify school is configured — keyed by schoolId (uid) not shared 'school' doc
-    // Each school has its OWN settings doc: settings/{uid}
     const settingsSnap = await db.collection('settings').doc(_schoolId).get();
     if(!settingsSnap.exists || !settingsSnap.data().name){
       window.location.href = 'settings.html'; return;
@@ -587,15 +616,46 @@ function toggleEye(){
 // ── LOGIN ──
 async function doLogin(){
   el('loginErr').classList.remove('show');
-  const email=el('liEmail').value.trim(), pass=el('liPass').value;
-  if(!email||!pass){
-    el('loginErrMsg').textContent='Please enter your email and password.';
+  const code  = el('liCode').value.trim().toUpperCase();
+  const email = el('liEmail').value.trim();
+  const pass  = el('liPass').value;
+  if(!code||!email||!pass){
+    el('loginErrMsg').textContent='School code, email and password are all required.';
     el('loginErr').classList.add('show'); return;
   }
   const btn=el('loginBtn'),txt=el('loginBtnTxt');
-  btn.disabled=true; txt.innerHTML='<div class="spin-sm"></div> Signing in…';
+  btn.disabled=true; txt.innerHTML='<div class="spin-sm"></div> Verifying…';
   try{
-    await auth.signInWithEmailAndPassword(email, pass);
+    // 1. Verify school code exists in Firestore BEFORE attempting Firebase Auth
+    const codeSnap = await db.collection('schoolCodes').doc(code).get();
+    if(!codeSnap.exists){
+      btn.disabled=false; txt.textContent='Sign In to Admin';
+      el('loginErrMsg').textContent='Invalid school code. Contact the system administrator.';
+      el('loginErr').classList.add('show'); return;
+    }
+    const codeData = codeSnap.data();
+
+    // 2. Sign in with Firebase Auth
+    const cred = await auth.signInWithEmailAndPassword(email, pass);
+
+    // 3. Verify email matches the code owner
+    if(codeData.adminEmail && codeData.adminEmail !== cred.user.email){
+      await auth.signOut();
+      btn.disabled=false; txt.textContent='Sign In to Admin';
+      el('loginErrMsg').textContent='This school code does not belong to your account.';
+      el('loginErr').classList.add('show'); return;
+    }
+
+    // 4. Update schoolCodes with real Firebase Auth uid (for data namespace)
+    //    schoolId = Firebase Auth uid — stable, authoritative
+    const authUid = cred.user.uid;
+    db.collection('schoolCodes').doc(code).update({
+      schoolId: authUid,
+      lastLogin: firebase.firestore.FieldValue.serverTimestamp()
+    }).catch(()=>{});
+
+    // 5. Store in memory only — no storage of any kind
+    _schoolCode = code;
     // onAuthStateChanged handles everything from here
   }catch(e){
     btn.disabled=false; txt.textContent='Sign In to Admin';
@@ -609,17 +669,18 @@ async function doLogin(){
   }
 }
 el('liPass').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); });
+el('liCode').addEventListener('keydown', e=>{ if(e.key==='Enter') el('liEmail').focus(); });
 
 // ── LOGOUT ──
 async function doLogout(){
   if(_ownerMsgUnsub){ _ownerMsgUnsub(); _ownerMsgUnsub=null; }
   if(_payGateUnsub){ _payGateUnsub(); _payGateUnsub=null; }
   await _endSession();
-  // Clear ALL school-specific cache — prevents bleeding to next school on same device
-  ['cbe_streams','cbe_streams_ts','cbe_current_uid'].forEach(k=>localStorage.removeItem(k));
-  Object.keys(localStorage)
-    .filter(k=>k.startsWith('cbe_school_settings_'))
-    .forEach(k=>localStorage.removeItem(k));
+  // Clear in-memory state only — no storage used
+  _schoolCode = null;
+  _schoolId   = null;
+  _schoolName = '';
+  window._schoolId = null;
   await auth.signOut();
   window.location.href = 'index.html';
 }
@@ -960,20 +1021,15 @@ async function onEditGradeChange(preselect=''){
   ss.innerHTML='<option value="">Loading…</option>';
   if(!grade){ss.innerHTML='<option value="">-- Select Grade first --</option>';if(hint)hint.textContent='';return;}
   let streams=[];
+  // Fetch directly from Firestore — no localStorage cache for security
   try{
-    const raw=localStorage.getItem('cbe_streams');
-    if(raw){const map=JSON.parse(raw);if(map[grade]?.length)streams=map[grade];}
-  }catch(_){}
-  try{
-    // Filter students by schoolId for stream discovery
     const snap=await db.collection('students')
       .where('grade','==',grade)
       .where('schoolId','==',_schoolId)
       .get();
-    const set=new Set(streams);
+    const set=new Set();
     snap.forEach(d=>{const s=d.data();if(s.stream?.trim())set.add(s.stream.trim());});
     streams=[...set].sort();
-    try{const raw=localStorage.getItem('cbe_streams');const map=raw?JSON.parse(raw):{};map[grade]=streams;localStorage.setItem('cbe_streams',JSON.stringify(map));localStorage.setItem('cbe_streams_ts',Date.now().toString());}catch(_){}
   }catch(_){}
   if(!streams.length){
     ss.innerHTML='<option value="">No streams found</option>';
@@ -1025,16 +1081,13 @@ async function onQrGradeChange(){
   ss.disabled=true;ss.innerHTML='<option value="">Loading…</option>';
   if(!grade){ss.innerHTML='<option value="">-- Stream --</option>';return;}
   let streams=[];
-  try{
-    const raw=localStorage.getItem('cbe_streams');
-    if(raw){const map=JSON.parse(raw);if(map[grade]?.length)streams=map[grade];}
-  }catch(_){}
+  // Fetch directly from Firestore — no localStorage cache for security
   try{
     const snap=await db.collection('students')
       .where('grade','==',grade)
       .where('schoolId','==',_schoolId)
       .get();
-    const set=new Set(streams);
+    const set=new Set();
     snap.forEach(d=>{const s=d.data();if(s.stream?.trim())set.add(s.stream.trim());});
     streams=[...set].sort();
   }catch(_){}
